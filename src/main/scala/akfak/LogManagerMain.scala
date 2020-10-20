@@ -11,6 +11,7 @@ import java.nio.file.{
   StandardCopyOption,
   StandardOpenOption
 }
+import java.util.UUID
 import scala.collection.mutable
 import scala.io.Source
 import scala.util.Using
@@ -23,16 +24,26 @@ object LogManagerMain {
 
     val broker = new Broker(workDir)
 
-//    if (!broker.topics.contains("my-topic"))
-//      broker.createTopic("my-topic", 4)
-//
-//    broker.send(
-//      "my-topic",
-//      "key".getBytes(StandardCharsets.UTF_8),
-//      "value".getBytes(StandardCharsets.UTF_8)
-//    )
+    if (!broker.topics.contains("my-topic"))
+      broker.createTopic("my-topic", 4)
 
-    broker.poll("my-topic", 3, 0)
+    for (i <- 0 to 10) {
+      val key = s"key-${i % 10}"
+      val value = s"value:${UUID.randomUUID()}"
+      println(s"send: $key - $value")
+      broker.send(
+        "my-topic",
+        key.getBytes(StandardCharsets.UTF_8),
+        value.getBytes(StandardCharsets.UTF_8)
+      )
+    }
+
+    val records = broker.poll("my-topic", 1, 0)
+    for {
+      (k, v) <- records
+    } {
+      println(s"poll: ${new String(k)} - ${new String(v)}")
+    }
   }
 }
 
@@ -72,7 +83,7 @@ class Broker(workDir: Path) {
     if (!partitionDir.toFile.exists())
       Files.createDirectories(partitionDir)
 
-    new Partition(partitionId, partitionDir)
+    new Partition(topic, partitionId, partitionDir, checkpointFile)
   }
 
   def poll(
@@ -97,7 +108,12 @@ class Broker(workDir: Path) {
 
 }
 
-class Partition(partitionId: Int, partitionDir: Path) {
+class Partition(
+    topic: String,
+    partitionId: Int,
+    partitionDir: Path,
+    checkpointFile: CheckpointFile
+) {
   val indexFile: IndexFile = {
     val file = partitionDir.resolve("partition.idx")
     if (!file.toFile.exists()) Files.createFile(file)
@@ -112,7 +128,14 @@ class Partition(partitionId: Int, partitionDir: Path) {
     new LogFile(file)
   }
 
-  def poll(offset: Int): List[(Array[Byte], Array[Byte])] = ???
+  def poll(offset: Int): List[(Array[Byte], Array[Byte])] = {
+    val maxOffset = checkpointFile.getOffset(topic, partitionId)
+
+    (offset until maxOffset)
+      .map(ofs => indexFile.getPositionOf(ofs))
+      .map(position => logFile.getRecord(position))
+      .toList
+  }
 
   def append(key: Array[Byte], value: Array[Byte], offset: Int): Int = {
     val position = logFile.append(key, value)
@@ -136,6 +159,27 @@ class LogFile(file: Path) {
 
       position
     }.get
+
+  def getRecord(position: Long): (Array[Byte], Array[Byte]) =
+    Using(FileChannel.open(file, StandardOpenOption.READ)) { channel =>
+      channel.position(position)
+
+      val keyValueSizeBuffer = ByteBuffer.allocate(4 + 4)
+      channel.read(keyValueSizeBuffer)
+      keyValueSizeBuffer.rewind()
+      val keySize = keyValueSizeBuffer.getInt()
+      val valueSize = keyValueSizeBuffer.getInt()
+
+      val keyBuffer = ByteBuffer.allocate(keySize)
+      channel.read(keyBuffer)
+      keyBuffer.rewind()
+
+      val valueBuffer = ByteBuffer.allocate(valueSize)
+      channel.read(valueBuffer)
+      valueBuffer.rewind()
+
+      (keyBuffer.array(), valueBuffer.array())
+    }.get
 }
 
 class IndexFile(file: Path) {
@@ -145,6 +189,18 @@ class IndexFile(file: Path) {
       val buffer = ByteBuffer.wrap(data.getBytes(StandardCharsets.UTF_8))
       channel.write(buffer)
     }
+
+  def getPositionOf(offset: Int): Long = {
+    Using(Source.fromFile(file.toFile)) { content =>
+      val positions =
+        (for (line <- content.getLines()) yield {
+          val fields = line.split(",", 2)
+          fields(0).toInt -> fields(1).toLong
+        }).toMap
+
+      positions(offset)
+    }.get
+  }
 }
 
 class CheckpointFile(file: Path) {
